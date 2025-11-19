@@ -108,7 +108,7 @@ class CameraViewController: UIViewController, AVCaptureDataOutputSynchronizerDel
     
     @IBOutlet weak var autoPanningSwitch: UISwitch!
     
-    @IBOutlet weak var autoSavingSwitch: UISwitch!
+    @IBOutlet weak var saveNowButton: UIButton!
     
     private enum SessionSetupResult {
         case success
@@ -135,11 +135,13 @@ class CameraViewController: UIViewController, AVCaptureDataOutputSynchronizerDel
     
     private var renderingEnabled = true
     
-    private var savingEnabled = false  // luozc
+    // Store latest frame data for manual saving
+    private var latestDepthData: AVDepthData?
+    private var latestVideoPixelBuffer: CVPixelBuffer?
+    private let frameLock = NSLock()
     
     lazy var context = CIContext()  //luozc
     
-    private var videoData: Data?  // luozc
     private let photoDepthConverter = DepthToUintConverter() // lzchao
     
     private let videoDeviceDiscoverySession = AVCaptureDevice.DiscoverySession(deviceTypes: [.builtInTrueDepthCamera],
@@ -154,8 +156,6 @@ class CameraViewController: UIViewController, AVCaptureDataOutputSynchronizerDel
     
     @IBOutlet weak private var cloudView: PointCloudMetalView!
     
-    @IBOutlet weak private var cloudToJETSegCtrl: UISegmentedControl!
-    
     @IBOutlet weak private var smoothDepthLabel: UILabel!
     
     private var lastScale = Float(1.0)
@@ -165,8 +165,6 @@ class CameraViewController: UIViewController, AVCaptureDataOutputSynchronizerDel
     private var lastZoom = Float(0.0)
     
     private var lastXY = CGPoint(x: 0, y: 0)
-    
-    private var JETEnabled = true
     
     private var viewFrameSize = CGSize()
     
@@ -203,7 +201,9 @@ class CameraViewController: UIViewController, AVCaptureDataOutputSynchronizerDel
         panOneFingerGesture.minimumNumberOfTouches = 1
         cloudView.addGestureRecognizer(panOneFingerGesture)
         
-        cloudToJETSegCtrl.selectedSegmentIndex = 0
+        // Always show 3D point cloud view
+        cloudView.isHidden = false
+        jetView.isHidden = true
         
         // Check video authorization status, video access is required
         switch AVCaptureDevice.authorizationStatus(for: .video) {
@@ -247,7 +247,12 @@ class CameraViewController: UIViewController, AVCaptureDataOutputSynchronizerDel
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         
-        let interfaceOrientation = UIApplication.shared.statusBarOrientation
+        let interfaceOrientation: UIInterfaceOrientation
+        if #available(iOS 13.0, *) {
+            interfaceOrientation = view.window?.windowScene?.interfaceOrientation ?? .portrait
+        } else {
+            interfaceOrientation = UIApplication.shared.statusBarOrientation
+        }
         statusBarOrientation = interfaceOrientation
         
         let initialThermalState = ProcessInfo.processInfo.thermalState
@@ -379,7 +384,12 @@ class CameraViewController: UIViewController, AVCaptureDataOutputSynchronizerDel
         super.viewWillTransition(to: size, with: coordinator)
         
         coordinator.animate(alongsideTransition: { _ in
-                let interfaceOrientation = UIApplication.shared.statusBarOrientation
+                let interfaceOrientation: UIInterfaceOrientation
+                if #available(iOS 13.0, *) {
+                    interfaceOrientation = self.view.window?.windowScene?.interfaceOrientation ?? .portrait
+                } else {
+                    interfaceOrientation = UIApplication.shared.statusBarOrientation
+                }
                 self.statusBarOrientation = interfaceOrientation
                 self.sessionQueue.async {
                     /*
@@ -560,19 +570,16 @@ class CameraViewController: UIViewController, AVCaptureDataOutputSynchronizerDel
     }
     
     @IBAction private func changeMixFactor(_ sender: UISlider) {
-        let mixFactor = sender.value
+        _ = sender.value
+        // TODO: Update VideoMixer mixFactor when implemented
     }
     
     @IBAction private func changeDepthSmoothing(_ sender: UISwitch) {
         let smoothingEnabled = sender.isOn
         
         sessionQueue.async {
-            self.depthDataOutput.isFilteringEnabled = true
+            self.depthDataOutput.isFilteringEnabled = smoothingEnabled
         }
-    }
-    
-    @IBAction func changeCloudToJET(_ sender: UISegmentedControl) {
-        JETEnabled = true
     }
     
     @IBAction private func focusAndExposeTap(_ gesture: UITapGestureRecognizer) {
@@ -800,24 +807,40 @@ class CameraViewController: UIViewController, AVCaptureDataOutputSynchronizerDel
     }
     
     // MARK: - Video + Depth Frame Processing
-// luozc
-    @IBAction func didAutoSavingChange(_ sender: Any) {
-        let savingEnabled = autoSavingSwitch.isOn ? true : false
+    @IBAction func saveNowButtonTapped(_ sender: UIButton) {
+        frameLock.lock()
+        defer { frameLock.unlock() }
+        
+        guard let depthData = latestDepthData,
+              let videoPixelBuffer = latestVideoPixelBuffer else {
+            print("No frame data available to save")
+            return
+        }
+        
+        // Get depth buffer for saving (Swift handles memory automatically)
+        let depthPixelBuffer = depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32).depthDataMap
+        
         processingQueue.async {
-            self.savingEnabled = savingEnabled
+            // Always save both formats regardless of view mode
+            self.saveFrameAndDepth(video: videoPixelBuffer, depth: depthPixelBuffer)
+            self.savePointCloud(depthData: depthData, colorPixelBuffer: videoPixelBuffer)
         }
     }
     
     @available(iOS 14.0, *)
-    func saveAllBufferInFrame(video videoPixelBuffer: CVPixelBuffer,
+    func saveFrameAndDepth(video videoPixelBuffer: CVPixelBuffer,
                               depth depthPixelBuffer: CVPixelBuffer) {
+        // Save RGB image to file
         let videoImage = CIImage(cvPixelBuffer: videoPixelBuffer)
         
         guard let perceptualColorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
-            videoData = nil
             return
         }
-        videoData = context.pngRepresentation(of: videoImage, format: .BGRA8, colorSpace: perceptualColorSpace)
+        
+        guard let videoData = context.pngRepresentation(of: videoImage, format: .BGRA8, colorSpace: perceptualColorSpace) else {
+            print("Failed to create PNG from video frame")
+            return
+        }
         
         if !self.photoDepthConverter.isPrepared {
             var depthFormatDescription: CMFormatDescription?
@@ -825,28 +848,12 @@ class CameraViewController: UIViewController, AVCaptureDataOutputSynchronizerDel
                                                          imageBuffer: depthPixelBuffer,
                                                          formatDescriptionOut: &depthFormatDescription)
             
-            /*
-             outputRetainedBufferCountHint is the number of pixel buffers we expect to hold on to from the renderer.
-             This value informs the renderer how to size its buffer pool and how many pixel buffers to preallocate.
-             Allow 3 frames of latency to cover the dispatch_async call.
-             */
             if let unwrappedDepthFormatDescription = depthFormatDescription {
                 self.photoDepthConverter.prepare(with: unwrappedDepthFormatDescription, outputRetainedBufferCountHint: 3)
             }
         }
         
-        PHPhotoLibrary.requestAuthorization { status in
-            if status == .authorized {
-                PHPhotoLibrary.shared().performChanges({
-                    // Save Video Frame to Photos Library only if it was generated
-                    if let videoData = self.videoData {
-                        let creationRequest = PHAssetCreationRequest.forAsset()
-                        creationRequest.addResource(with: .photo,
-                                                    data: videoData,
-                                                    options: nil)
-                    }
-// lzchao
-                    // TODO: lzchao save depth json to file manager
+        // Save depth JSON to file
                     guard let convertedDepthPixelBuffer = self.photoDepthConverter.render(pixelBuffer: depthPixelBuffer) else {
                         print("Unable to convert depth pixel buffer")
                         return
@@ -860,24 +867,157 @@ class CameraViewController: UIViewController, AVCaptureDataOutputSynchronizerDel
                         formatter.locale = Locale.init(identifier: "en_US_POSIX")
                         let timeInterval = Date().timeIntervalSince1970
                         let msecond = CLongLong(round(timeInterval * 1000))
-                        let FileName =  String(format: "/%@_\(msecond).json", formatter.string(from: Date()))
+            let timestamp = formatter.string(from: Date())
 
-                        let pathWithFileName = documentDirectory.appendingPathComponent(String(FileName))
+            // Save RGB image
+            let imageFileName = String(format: "frame_%@_\(msecond).png", timestamp)
+            let imageFileURL = documentDirectory.appendingPathComponent(imageFileName)
                         do {
-                            try wrappedDepthJson.write(to: pathWithFileName)
+                try videoData.write(to: imageFileURL)
+                print("Frame saved to: \(imageFileURL.path)")
                         } catch {
-                            print("Could not write \(FileName) at dir: \(documentDirectory)")
-                        }
-                    }
-// lzchao
-                }, completionHandler: { _, error in
-                    if let error = error {
-                        print("Error occurred while saving photo to photo library: \(error)")
+                print("Could not write image file: \(error)")
+            }
+            
+            // Save depth JSON
+            let jsonFileName = String(format: "depth_%@_\(msecond).json", timestamp)
+            let jsonFileURL = documentDirectory.appendingPathComponent(jsonFileName)
+            do {
+                try wrappedDepthJson.write(to: jsonFileURL)
+                print("Depth data saved to: \(jsonFileURL.path)")
+            } catch {
+                print("Could not write depth JSON file: \(error)")
+            }
+        }
+    }
+    
+    @available(iOS 14.0, *)
+    func savePointCloud(depthData: AVDepthData, colorPixelBuffer: CVPixelBuffer) {
+        // Convert to Float32 depth format for easier processing
+        let convertedDepthData = depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32)
+        let depthPixelBuffer = convertedDepthData.depthDataMap
+        let depthWidth = CVPixelBufferGetWidth(depthPixelBuffer)
+        let depthHeight = CVPixelBufferGetHeight(depthPixelBuffer)
+        
+        // Get camera intrinsics (use original depthData as calibration is preserved)
+        guard let calibrationData = depthData.cameraCalibrationData else {
+            print("No camera calibration data available")
+            return
+        }
+        
+        var intrinsics = calibrationData.intrinsicMatrix
+        let referenceDimensions = calibrationData.intrinsicMatrixReferenceDimensions
+        
+        // Scale intrinsics to match actual depth buffer size
+        let ratio = Float(referenceDimensions.width) / Float(depthWidth)
+        intrinsics.columns.0.x /= ratio
+        intrinsics.columns.1.y /= ratio
+        intrinsics.columns.2.x /= ratio
+        intrinsics.columns.2.y /= ratio
+        
+        // Lock buffers for reading
+        CVPixelBufferLockBaseAddress(depthPixelBuffer, .readOnly)
+        CVPixelBufferLockBaseAddress(colorPixelBuffer, .readOnly)
+        defer {
+            CVPixelBufferUnlockBaseAddress(depthPixelBuffer, .readOnly)
+            CVPixelBufferUnlockBaseAddress(colorPixelBuffer, .readOnly)
+        }
+        
+        // Get depth data
+        let depthBaseAddress = CVPixelBufferGetBaseAddress(depthPixelBuffer)
+        let depthBytesPerRow = CVPixelBufferGetBytesPerRow(depthPixelBuffer)
+        let depthPointer = depthBaseAddress?.assumingMemoryBound(to: Float32.self)
+        
+        // Get color data
+        let colorBaseAddress = CVPixelBufferGetBaseAddress(colorPixelBuffer)
+        let colorBytesPerRow = CVPixelBufferGetBytesPerRow(colorPixelBuffer)
+        let colorPointer = colorBaseAddress?.assumingMemoryBound(to: UInt8.self)
+        
+        guard let depthPtr = depthPointer, let colorPtr = colorPointer else {
+            print("Failed to get buffer pointers")
+            return
+        }
+        
+        // Extract point cloud data
+        var points: [(x: Float, y: Float, z: Float, r: UInt8, g: UInt8, b: UInt8)] = []
+        points.reserveCapacity(depthWidth * depthHeight)
+        
+        let fx = intrinsics.columns.0.x
+        let fy = intrinsics.columns.1.y
+        let cx = intrinsics.columns.2.x
+        let cy = intrinsics.columns.2.y
+        
+        // Scale factor for color to depth
+        let colorWidth = CVPixelBufferGetWidth(colorPixelBuffer)
+        let colorHeight = CVPixelBufferGetHeight(colorPixelBuffer)
+        let scaleX = Float(colorWidth) / Float(depthWidth)
+        let scaleY = Float(colorHeight) / Float(depthHeight)
+        
+        for y in 0..<depthHeight {
+            for x in 0..<depthWidth {
+                let depthIndex = y * (depthBytesPerRow / MemoryLayout<Float32>.size) + x
+                let depth = depthPtr[depthIndex]
+                
+                // Skip invalid depth values (0 or too far)
+                if depth > 0 && depth < 5.0 { // 5 meters max
+                    // Convert depth pixel to 3D coordinates
+                    let xrw = (Float(x) - cx) * depth / fx
+                    let yrw = (Float(y) - cy) * depth / fy
+                    let zrw = depth
+                    
+                    // Get color from color buffer (scale coordinates)
+                    let colorX = Int(Float(x) * scaleX)
+                    let colorY = Int(Float(y) * scaleY)
+                    
+                    if colorX < colorWidth && colorY < colorHeight {
+                        let colorIndex = colorY * (colorBytesPerRow / MemoryLayout<UInt8>.size) + colorX * 4
+                        let b = colorPtr[colorIndex]
+                        let g = colorPtr[colorIndex + 1]
+                        let r = colorPtr[colorIndex + 2]
+                        // Skip alpha channel
+                        
+                        points.append((x: xrw, y: yrw, z: zrw, r: r, g: g, b: b))
                     }
                 }
-                )
-            } else {
-                print("Without authorized")
+            }
+        }
+        
+        // Save as PLY file
+        if let documentDirectory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+            let formatter = DateFormatter()
+            formatter.dateFormat = "yy-MM-dd_HH-mm-ss"
+            formatter.locale = Locale.init(identifier: "en_US_POSIX")
+            let timeInterval = Date().timeIntervalSince1970
+            let msecond = CLongLong(round(timeInterval * 1000))
+            let fileName = String(format: "pointcloud_%@_\(msecond).ply", formatter.string(from: Date()))
+            
+            let fileURL = documentDirectory.appendingPathComponent(fileName)
+            
+            // Write PLY file
+            var plyContent = "ply\n"
+            plyContent += "format ascii 1.0\n"
+            plyContent += "comment Generated from TrueDepth camera\n"
+            plyContent += "element vertex \(points.count)\n"
+            plyContent += "property float x\n"
+            plyContent += "property float y\n"
+            plyContent += "property float z\n"
+            plyContent += "property uchar red\n"
+            plyContent += "property uchar green\n"
+            plyContent += "property uchar blue\n"
+            plyContent += "end_header\n"
+            
+            // Write points
+            for point in points {
+                plyContent += String(format: "%.6f %.6f %.6f %d %d %d\n",
+                                   point.x, point.y, point.z,
+                                   point.r, point.g, point.b)
+            }
+            
+            do {
+                try plyContent.write(to: fileURL, atomically: true, encoding: .utf8)
+                print("Point cloud saved to: \(fileURL.path)")
+            } catch {
+                print("Could not write point cloud file: \(error)")
             }
         }
     }
@@ -904,43 +1044,35 @@ class CameraViewController: UIViewController, AVCaptureDataOutputSynchronizerDel
         }
         
         let depthData = syncedDepthData.depthData
-        // TODO: choose 16bit or 32bit
-        let depthPixelBuffer = depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32).depthDataMap
         let sampleBuffer = syncedVideoData.sampleBuffer
         guard let videoPixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
                 return
         }
         
-// luozc
-        if savingEnabled {
-            processingQueue.async {
-                self.saveAllBufferInFrame(video: videoPixelBuffer, depth: depthPixelBuffer)
-            }
-        }
-// luozc
+        // Store latest frame data for manual saving (Swift handles memory automatically)
+        frameLock.lock()
+        latestDepthData = depthData
+        latestVideoPixelBuffer = videoPixelBuffer
+        frameLock.unlock()
         
-        if JETEnabled {
-            jetView.pixelBuffer = videoPixelBuffer
-        } else {
-            // point cloud
-            if self.autoPanningIndex >= 0 {
-                
-                // perform a circle movement
-                let moves = 200
-                
-                let factor = 2.0 * .pi / Double(moves)
-                
-                let pitch = sin(Double(self.autoPanningIndex) * factor) * 2
-                let yaw = cos(Double(self.autoPanningIndex) * factor) * 2
-                self.autoPanningIndex = (self.autoPanningIndex + 1) % moves
-                
-                cloudView?.resetView()
-                cloudView?.pitchAroundCenter(Float(pitch) * 10)
-                cloudView?.yawAroundCenter(Float(yaw) * 10)
-            }
+        // Always show 3D point cloud
+        if self.autoPanningIndex >= 0 {
             
-            cloudView?.setDepthFrame(depthData, withTexture: videoPixelBuffer)
+            // perform a circle movement
+            let moves = 200
+            
+            let factor = 2.0 * .pi / Double(moves)
+            
+            let pitch = sin(Double(self.autoPanningIndex) * factor) * 2
+            let yaw = cos(Double(self.autoPanningIndex) * factor) * 2
+            self.autoPanningIndex = (self.autoPanningIndex + 1) % moves
+            
+            cloudView?.resetView()
+            cloudView?.pitchAroundCenter(Float(pitch) * 10)
+            cloudView?.yawAroundCenter(Float(yaw) * 10)
         }
+        
+        cloudView?.setDepthFrame(depthData, withTexture: videoPixelBuffer)
     }
     
 //    func updateDepthLabel(depthFrame: CVPixelBuffer, videoFrame: CVPixelBuffer) {

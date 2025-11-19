@@ -171,7 +171,9 @@ class DepthToUintConverter: FilterRenderer {
         commandEncoder.setComputePipelineState(computePipelineState!)
         commandEncoder.setTexture(inputTexture, index: 0)
         commandEncoder.setTexture(outputTexture, index: 1)
-        commandEncoder.setBytes( UnsafeMutableRawPointer(&range), length: MemoryLayout<DepthRenderParam>.size, index: 0)
+        withUnsafeBytes(of: range) { bytes in
+            commandEncoder.setBytes(bytes.baseAddress!, length: MemoryLayout<DepthRenderParam>.size, index: 0)
+        }
         
         // Set up the thread groups.
         let width = computePipelineState!.threadExecutionWidth

@@ -104,6 +104,12 @@
                                             <action selector="saveNowButtonTapped:" destination="BYZ-38-t0r" eventType="touchUpInside" id="fMw-gB-tOz"/>
                                         </connections>
                                     </button>
+                                    <label opaque="NO" userInteractionEnabled="NO" contentMode="left" horizontalHuggingPriority="251" verticalHuggingPriority="251" text="Position your face in the center" textAlignment="center" lineBreakMode="tailTruncation" numberOfLines="0" baselineAdjustment="alignBaselines" adjustsFontSizeToFit="NO" translatesAutoresizingMaskIntoConstraints="NO" id="guidance-label">
+                                        <rect key="frame" x="20" y="100" width="374" height="60"/>
+                                        <fontDescription key="fontDescription" type="system" pointSize="18"/>
+                                        <color key="textColor" red="1" green="0.98406440019999997" blue="0.001863333862" alpha="1" colorSpace="custom" customColorSpace="sRGB"/>
+                                        <nil key="highlightedColor"/>
+                                    </label>
                                 </subviews>
                                 <color key="backgroundColor" red="0.0" green="0.0" blue="0.0" alpha="1" colorSpace="custom" customColorSpace="sRGB"/>
                                 <constraints>
@@ -112,6 +118,9 @@
                                     <constraint firstItem="Fm2-sp-46o" firstAttribute="centerY" secondItem="yy3-zH-gY9" secondAttribute="centerY" id="qGG-m3-X9G"/>
                                     <constraint firstItem="DxT-BO-sK2" firstAttribute="centerX" secondItem="Qzi-3c-VQI" secondAttribute="centerX" id="save-btn-centerX"/>
                                     <constraint firstItem="yy3-zH-gY9" firstAttribute="top" secondItem="DxT-BO-sK2" secondAttribute="bottom" constant="10" id="save-btn-top"/>
+                                    <constraint firstItem="guidance-label" firstAttribute="leading" secondItem="Qzi-3c-VQI" secondAttribute="leading" constant="20" id="guidance-leading"/>
+                                    <constraint firstItem="guidance-label" firstAttribute="trailing" secondItem="Qzi-3c-VQI" secondAttribute="trailing" constant="-20" id="guidance-trailing"/>
+                                    <constraint firstItem="guidance-label" firstAttribute="top" secondItem="Qzi-3c-VQI" secondAttribute="top" constant="100" id="guidance-top"/>
                                 </constraints>
                             </view>
                             <label hidden="YES" userInteractionEnabled="NO" contentMode="left" horizontalHuggingPriority="251" verticalHuggingPriority="251" text="TrueDepth Camera Unavailable" textAlignment="center" lineBreakMode="tailTruncation" numberOfLines="0" baselineAdjustment="alignBaselines" adjustsFontSizeToFit="NO" translatesAutoresizingMaskIntoConstraints="NO" id="B08-Wv-b5R" userLabel="Camera Unavailable">
@@ -163,6 +172,7 @@
                         <outlet property="autoPanningSwitch" destination="yy3-zH-gY9" id="KN3-UL-caQ"/>
                         <outlet property="cameraUnavailableLabel" destination="B08-Wv-b5R" id="zOh-RF-43A"/>
                         <outlet property="cloudView" destination="Qzi-3c-VQI" id="4GD-1c-K9J"/>
+                        <outlet property="guidanceLabel" destination="guidance-label" id="guidance-outlet"/>
                         <outlet property="depthSmoothingSwitch" destination="9Aw-a4-Jqw" id="plJ-q5-xAr"/>
                         <outlet property="jetView" destination="ajY-TT-566" id="a0f-H1-2Fr"/>
                         <outlet property="mixFactorSlider" destination="x5F-tE-pbz" id="y4U-DD-NqG"/>

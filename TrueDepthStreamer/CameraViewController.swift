@@ -158,6 +158,28 @@ class CameraViewController: UIViewController, AVCaptureDataOutputSynchronizerDel
     
     @IBOutlet weak private var smoothDepthLabel: UILabel!
     
+    @IBOutlet weak var guidanceLabel: UILabel!
+    
+    // Minimal tracking - just for basic metrics
+    private struct QualityMetrics {
+        var averageDistance: Float = 0.0  // Average distance from camera (meters)
+        var totalPoints: Int = 0
+    }
+    
+    // Simple thresholds - just need enough points for a complete scan
+    private struct QualityThresholds {
+        static let minPoints: Int = 20000  // Need enough points to avoid holes
+    }
+    
+    
+    private var qualityMetrics = QualityMetrics()
+    private var accumulatedPoints: [(x: Float, y: Float, z: Float)] = []
+    private let coverageAnalysisQueue = DispatchQueue(label: "coverage analysis", qos: .userInitiated)
+    private var lastCoverageUpdate = Date()
+    private var scanStartTime: Date?
+    private var frameCount = 0
+    private var distanceHistory: [Float] = []  // Track distance for basic info
+    
     private var lastScale = Float(1.0)
     
     private var lastScaleDiff = Float(0.0)
@@ -204,6 +226,22 @@ class CameraViewController: UIViewController, AVCaptureDataOutputSynchronizerDel
         // Always show 3D point cloud view
         cloudView.isHidden = false
         jetView.isHidden = true
+        
+        // Initialize guidance
+        guidanceLabel.text = "Position your face in the center and hold still"
+        guidanceLabel.textColor = .yellow
+        guidanceLabel.textAlignment = .center
+        guidanceLabel.font = UIFont.systemFont(ofSize: 18, weight: .medium)
+        guidanceLabel.numberOfLines = 0
+        saveNowButton.isEnabled = false
+        saveNowButton.alpha = 0.5
+        
+        // Reset scan state
+        accumulatedPoints.removeAll()
+        qualityMetrics = QualityMetrics()
+        scanStartTime = nil
+        frameCount = 0
+        distanceHistory.removeAll()
         
         // Check video authorization status, video access is required
         switch AVCaptureDevice.authorizationStatus(for: .video) {
@@ -808,6 +846,9 @@ class CameraViewController: UIViewController, AVCaptureDataOutputSynchronizerDel
     
     // MARK: - Video + Depth Frame Processing
     @IBAction func saveNowButtonTapped(_ sender: UIButton) {
+        // Just save - no complex checks
+        
+        
         frameLock.lock()
         defer { frameLock.unlock() }
         
@@ -824,6 +865,19 @@ class CameraViewController: UIViewController, AVCaptureDataOutputSynchronizerDel
             // Always save both formats regardless of view mode
             self.saveFrameAndDepth(video: videoPixelBuffer, depth: depthPixelBuffer)
             self.savePointCloud(depthData: depthData, colorPixelBuffer: videoPixelBuffer)
+        }
+        
+        // Reset after saving
+        DispatchQueue.main.async {
+            self.accumulatedPoints.removeAll()
+            self.qualityMetrics = QualityMetrics()
+            self.scanStartTime = nil
+            self.frameCount = 0
+            self.distanceHistory.removeAll()
+            self.guidanceLabel.text = "Scan saved!\nPosition face to start new scan"
+            self.guidanceLabel.textColor = .green
+            self.saveNowButton.isEnabled = false
+            self.saveNowButton.alpha = 0.5
         }
     }
     
@@ -1056,23 +1110,151 @@ class CameraViewController: UIViewController, AVCaptureDataOutputSynchronizerDel
         frameLock.unlock()
         
         // Always show 3D point cloud
-        if self.autoPanningIndex >= 0 {
+            if self.autoPanningIndex >= 0 {
+                
+                // perform a circle movement
+                let moves = 200
+                
+                let factor = 2.0 * .pi / Double(moves)
+                
+                let pitch = sin(Double(self.autoPanningIndex) * factor) * 2
+                let yaw = cos(Double(self.autoPanningIndex) * factor) * 2
+                self.autoPanningIndex = (self.autoPanningIndex + 1) % moves
+                
+                cloudView?.resetView()
+                cloudView?.pitchAroundCenter(Float(pitch) * 10)
+                cloudView?.yawAroundCenter(Float(yaw) * 10)
+            }
             
-            // perform a circle movement
-            let moves = 200
-            
-            let factor = 2.0 * .pi / Double(moves)
-            
-            let pitch = sin(Double(self.autoPanningIndex) * factor) * 2
-            let yaw = cos(Double(self.autoPanningIndex) * factor) * 2
-            self.autoPanningIndex = (self.autoPanningIndex + 1) % moves
-            
-            cloudView?.resetView()
-            cloudView?.pitchAroundCenter(Float(pitch) * 10)
-            cloudView?.yawAroundCenter(Float(yaw) * 10)
-        }
+            cloudView?.setDepthFrame(depthData, withTexture: videoPixelBuffer)
         
-        cloudView?.setDepthFrame(depthData, withTexture: videoPixelBuffer)
+        // Track scan start time
+        if scanStartTime == nil {
+            scanStartTime = Date()
+        }
+        frameCount += 1
+        
+        // Analyze coverage for guidance (throttle to every 0.3 seconds for more responsive updates)
+        // Start analyzing after 1 second and at least 5 frames
+        let now = Date()
+        if let startTime = scanStartTime,
+           now.timeIntervalSince(startTime) > 1.0,
+           frameCount > 5,
+           now.timeIntervalSince(lastCoverageUpdate) > 0.3 {
+            lastCoverageUpdate = now
+            analyzeCoverage(depthData: depthData, colorPixelBuffer: videoPixelBuffer)
+        }
+    }
+    
+    @available(iOS 14.0, *)
+    private func analyzeCoverage(depthData: AVDepthData, colorPixelBuffer: CVPixelBuffer) {
+        coverageAnalysisQueue.async {
+            // Convert to Float32 depth format
+            let convertedDepthData = depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32)
+            let depthPixelBuffer = convertedDepthData.depthDataMap
+            let depthWidth = CVPixelBufferGetWidth(depthPixelBuffer)
+            let depthHeight = CVPixelBufferGetHeight(depthPixelBuffer)
+            
+            guard let calibrationData = depthData.cameraCalibrationData else {
+                return
+            }
+            
+            var intrinsics = calibrationData.intrinsicMatrix
+            let referenceDimensions = calibrationData.intrinsicMatrixReferenceDimensions
+            let ratio = Float(referenceDimensions.width) / Float(depthWidth)
+            intrinsics.columns.0.x /= ratio
+            intrinsics.columns.1.y /= ratio
+            intrinsics.columns.2.x /= ratio
+            intrinsics.columns.2.y /= ratio
+            
+            CVPixelBufferLockBaseAddress(depthPixelBuffer, .readOnly)
+            defer { CVPixelBufferUnlockBaseAddress(depthPixelBuffer, .readOnly) }
+            
+            let depthBaseAddress = CVPixelBufferGetBaseAddress(depthPixelBuffer)
+            let depthBytesPerRow = CVPixelBufferGetBytesPerRow(depthPixelBuffer)
+            let depthPointer = depthBaseAddress?.assumingMemoryBound(to: Float32.self)
+            
+            guard let depthPtr = depthPointer else { return }
+            
+            let fx = intrinsics.columns.0.x
+            let fy = intrinsics.columns.1.y
+            let cx = intrinsics.columns.2.x
+            let cy = intrinsics.columns.2.y
+            
+            var framePoints: [(x: Float, y: Float, z: Float)] = []
+            
+            // Sample points from current frame (every 4th pixel for performance)
+            for y in stride(from: 0, to: depthHeight, by: 4) {
+                for x in stride(from: 0, to: depthWidth, by: 4) {
+                    let depthIndex = y * (depthBytesPerRow / MemoryLayout<Float32>.size) + x
+                    let depth = depthPtr[depthIndex]
+                    
+                    if depth > 0 && depth < 5.0 {
+                        let xrw = (Float(x) - cx) * depth / fx
+                        let yrw = (Float(y) - cy) * depth / fy
+                        let zrw = depth
+                        framePoints.append((x: xrw, y: yrw, z: zrw))
+                    }
+                }
+            }
+            
+            // Add to accumulated points - keep all points for complete scan
+            // This ensures we capture all angles and avoid holes
+            self.accumulatedPoints.append(contentsOf: framePoints)
+            
+            // Keep last 150k points to avoid memory issues, but prioritize recent frames
+            if self.accumulatedPoints.count > 150000 {
+                // Remove oldest 25% to make room for new points
+                let removeCount = self.accumulatedPoints.count - 150000
+                self.accumulatedPoints.removeFirst(removeCount)
+            }
+            
+            // Calculate basic distance metrics early (for initial guidance)
+            if self.accumulatedPoints.count > 1000 {
+                let zValues = self.accumulatedPoints.map { $0.z }
+                let averageZ = zValues.reduce(0, +) / Float(zValues.count)
+                self.qualityMetrics.averageDistance = averageZ
+                
+                // Track distance history for stability
+                self.distanceHistory.append(averageZ)
+                if self.distanceHistory.count > 30 {
+                    self.distanceHistory.removeFirst()
+                }
+                
+            }
+            
+            // Update basic metrics
+            if self.accumulatedPoints.count > 1000 {
+                let zValues = self.accumulatedPoints.map { $0.z }
+                let averageZ = zValues.reduce(0, +) / Float(zValues.count)
+                self.qualityMetrics.averageDistance = averageZ
+                self.qualityMetrics.totalPoints = self.accumulatedPoints.count
+            }
+            
+            // Update UI on main thread
+            DispatchQueue.main.async {
+                self.updateGuidanceLabel()
+            }
+        }
+    }
+    
+    private func updateGuidanceLabel() {
+        // Super simple - just show progress and enable save when ready
+        let pointCount = accumulatedPoints.count
+        let hasEnoughPoints = pointCount >= QualityThresholds.minPoints
+        
+        if hasEnoughPoints {
+            saveNowButton.isEnabled = true
+            saveNowButton.alpha = 1.0
+            guidanceLabel.text = "Ready to save\n\(pointCount) points"
+            guidanceLabel.textColor = .green
+        } else {
+            saveNowButton.isEnabled = false
+            saveNowButton.alpha = 0.5
+            let progress = min(100, Int((Float(pointCount) / Float(QualityThresholds.minPoints)) * 100))
+            guidanceLabel.text = "Capturing... \(progress)%\nMove head slowly in all directions"
+            guidanceLabel.textColor = .yellow
+        }
     }
     
 //    func updateDepthLabel(depthFrame: CVPixelBuffer, videoFrame: CVPixelBuffer) {

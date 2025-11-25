@@ -3,8 +3,8 @@ services:
     name: mesh-cleanup-api
     runtime: docker
     plan: free  # or starter ($7/month) for better performance
-    dockerfilePath: ./Dockerfile
-    dockerContext: .
+    dockerfilePath: ./mesh_cleanup_api/Dockerfile
+    dockerContext: ./mesh_cleanup_api
     envVars:
       - key: PYTHON_VERSION
         value: 3.10
